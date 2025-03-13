@@ -39,10 +39,6 @@ pub mod proto {
 pub struct SP1CudaProver {
     /// The gRPC client to communicate with the container.
     client: Client,
-    /// The name of the container.
-    container_name: String,
-    /// A flag to indicate whether the container has already been cleaned up.
-    cleaned_up: Arc<AtomicBool>,
 }
 
 /// The payload for the [sp1_prover::SP1Prover::setup] method.
@@ -104,74 +100,22 @@ impl SP1CudaProver {
     /// Creates a new [SP1Prover] that runs inside a Docker container and returns a
     /// [SP1ProverClient] that can be used to communicate with the container.
     pub fn new() -> Result<Self, Box<dyn StdError>> {
-        let container_name = "sp1-gpu";
-        let image_name = std::env::var("SP1_GPU_IMAGE")
-            .unwrap_or_else(|_| "public.ecr.aws/succinct-labs/moongate:v4.1.0".to_string());
-
-        let cleaned_up = Arc::new(AtomicBool::new(false));
-        let cleanup_name = container_name;
-        let cleanup_flag = cleaned_up.clone();
-
-        // Check if Docker is available and the user has necessary permissions
-        if !Self::check_docker_availability()? {
-            return Err("Docker is not available or you don't have the necessary permissions. Please ensure Docker is installed and you are part of the docker group.".into());
-        }
-
-        // Pull the docker image if it's not present
-        if let Err(e) = Command::new("docker").args(["pull", &image_name]).output() {
-            return Err(format!("Failed to pull Docker image: {}. Please check your internet connection and Docker permissions.", e).into());
-        }
-
-        // Start the docker container
-        let rust_log_level = std::env::var("RUST_LOG").unwrap_or_else(|_| "none".to_string());
-        Command::new("docker")
-            .args([
-                "run",
-                "-e",
-                &format!("RUST_LOG={}", rust_log_level),
-                "-p",
-                "3000:3000",
-                "--rm",
-                "--gpus",
-                "all",
-                "--name",
-                container_name,
-                &image_name,
-            ])
-            // Redirect stdout and stderr to the parent process
-            .stdout(Stdio::inherit())
-            .stderr(Stdio::inherit())
-            .spawn()
-            .map_err(|e| format!("Failed to start Docker container: {}. Please check your Docker installation and permissions.", e))?;
-
-        // Kill the container on control-c
-        ctrlc::set_handler(move || {
-            tracing::debug!("received Ctrl+C, cleaning up...");
-            if !cleanup_flag.load(Ordering::SeqCst) {
-                cleanup_container(cleanup_name);
-                cleanup_flag.store(true, Ordering::SeqCst);
-            }
-            std::process::exit(0);
-        })
-        .unwrap();
-
-        // Wait a few seconds for the container to start
-        std::thread::sleep(Duration::from_secs(2));
+        let gpu_service_url = gpu_service_url();
 
         // Check if the container is ready
         let client = Client::from_base_url(
-            Url::parse("http://localhost:3000/twirp/").expect("failed to parse url"),
+            Url::parse(&gpu_service_url).expect("failed to parse url"),
         )
         .expect("failed to create client");
 
-        let timeout = Duration::from_secs(300);
+        let timeout = Duration::from_secs(30);
         let start_time = Instant::now();
 
         block_on(async {
             tracing::info!("waiting for proving server to be ready");
             loop {
                 if start_time.elapsed() > timeout {
-                    return Err("Timeout: proving server did not become ready within 60 seconds. Please check your Docker container and network settings.".to_string());
+                    return Err("Timeout: proving server did not become ready within 30 seconds. Please check your network settings.".to_string());
                 }
 
                 let request = ReadyRequest {};
@@ -193,7 +137,7 @@ impl SP1CudaProver {
         })?;
 
         let client = Client::new(
-            Url::parse("http://localhost:3000/twirp/").expect("failed to parse url"),
+            Url::parse(&gpu_service_url).expect("failed to parse url"),
             reqwest::Client::new(),
             vec![Box::new(LoggingMiddleware) as Box<dyn Middleware>],
         )
@@ -201,8 +145,6 @@ impl SP1CudaProver {
 
         Ok(SP1CudaProver {
             client,
-            container_name: container_name.to_string(),
-            cleaned_up: cleaned_up.clone(),
         })
     }
 
@@ -292,26 +234,6 @@ impl Default for SP1CudaProver {
     }
 }
 
-impl Drop for SP1CudaProver {
-    fn drop(&mut self) {
-        if !self.cleaned_up.load(Ordering::SeqCst) {
-            tracing::debug!("dropping SP1ProverClient, cleaning up...");
-            cleanup_container(&self.container_name);
-            self.cleaned_up.store(true, Ordering::SeqCst);
-        }
-    }
-}
-
-/// Cleans up the a docker container with the given name.
-fn cleanup_container(container_name: &str) {
-    if let Err(e) = Command::new("docker").args(["rm", "-f", container_name]).output() {
-        eprintln!(
-            "Failed to remove container: {}. You may need to manually remove it using 'docker rm -f {}'",
-            e, container_name
-        );
-    }
-}
-
 /// Utility method for blocking on an async function.
 ///
 /// If we're already in a tokio runtime, we'll block in place. Otherwise, we'll create a new
@@ -343,6 +265,10 @@ impl Middleware for LoggingMiddleware {
             Err(e) => Err(e),
         }
     }
+}
+
+fn gpu_service_url() -> String {
+    std::env::var("SP1_GPU_SERVICE_URL").unwrap_or("http://localhost:3000/twirp/".to_string())
 }
 
 // #[cfg(feature = "protobuf")]
